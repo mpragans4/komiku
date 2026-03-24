@@ -98,8 +98,12 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml"], async (req, res
     });
     if (!resp.ok) return res.status(resp.status).end();
     let xml = await resp.text();
+    // Rewrite semua domain origin yang mungkin muncul di sitemap
     xml = xml.replace(buildOriginRegex(), `https://${mirrorHost}`);
-    // Tambahkan lastmod jika tidak ada (membantu indexing)
+    // Rewrite juga domain alternatif (secure.komikid.org, komikid.org, dll)
+    xml = xml.replace(/https?:\/\/(www\.)?(secure\.)?komikid\.org/gi, `https://${mirrorHost}`);
+    // Hapus XSLT stylesheet reference agar browser tidak error
+    xml = xml.replace(/<\?xml-stylesheet[^?]*\?>\s*/gi, "");
     res.set("Content-Type", "application/xml; charset=utf-8");
     res.set("Cache-Control", "public, max-age=3600, s-maxage=86400");
     res.set("X-Robots-Tag", "noindex");
@@ -202,6 +206,8 @@ app.all("*", async (req, res) => {
 
       // --- A. REWRITE SEMUA URL ORIGIN → MIRROR ---
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
+      // Rewrite juga domain alternatif (secure.komikid.org, komikid.org)
+      html = html.replace(/https?:\/\/(www\.)?(secure\.)?komikid\.org/gi, `https://${mirrorHost}`);
 
       // --- B. HAPUS SEMUA CANONICAL LAMA & INJECT CANONICAL BARU ---
       html = html.replace(/<link[^>]*rel=["']canonical["'][^>]*\/?>/gi, "");
