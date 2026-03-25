@@ -181,6 +181,22 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xm
     xml = xml.replace(/https?:\/\/(www\.)?(secure\.)?komikid\.org/gi, `https://${mirrorHost}`);
     // Hapus XSLT stylesheet reference agar browser tidak error
     xml = xml.replace(/<\?xml-stylesheet[^?]*\?>\s*/gi, "");
+
+    // Fix invalid <lastmod> dates — sanitize to valid W3C datetime (ISO 8601)
+    xml = xml.replace(/<lastmod>([^<]*)<\/lastmod>/gi, (match, dateStr) => {
+      const trimmed = dateStr.trim();
+      if (!trimmed) return ""; // remove empty lastmod
+      // Try parsing the date
+      const parsed = new Date(trimmed);
+      if (isNaN(parsed.getTime())) {
+        // If completely unparseable, remove the tag
+        return "";
+      }
+      // Output as valid ISO 8601 date (YYYY-MM-DD or full datetime)
+      const iso = parsed.toISOString(); // e.g. 2025-03-25T00:00:00.000Z
+      return `<lastmod>${iso}</lastmod>`;
+    });
+
     res.set("Content-Type", "application/xml; charset=utf-8");
     res.set("Cache-Control", "public, max-age=3600, s-maxage=86400");
     res.set("X-Robots-Tag", "noindex");
