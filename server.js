@@ -208,6 +208,15 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xm
 });
 
 // ============================================================
+// ADS DATA — Return empty valid JSON for popup/ads endpoints
+// ============================================================
+app.get("/api-proxy/ads/data/*", (req, res) => {
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.set("Cache-Control", "public, max-age=3600");
+  res.json([]);
+});
+
+// ============================================================
 // ANALYTICS PROXY — Proxy requests to analytics.komiku.org
 // ============================================================
 app.all("/analytics-proxy/*", async (req, res) => {
@@ -676,7 +685,7 @@ app.all("*", async (req, res) => {
 
       // --- Inject jQuery CDN fallback (sebelum script lain) ---
       const jqueryFallback = `
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js" integrity="sha512-v2CJ7UaYy4JwqLDIrZUI/4hqeoQieOmAZNXBeQyjo21dadnwR+8ZaIJVT8EE2ez9n99UhA2o/5cYakMYXeLMQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>`;
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>`;
 
       html = html.replace(/<head([^>]*)>/i, `<head$1>\n${seoHeadInjection}\n${jqueryFallback}`);
 
