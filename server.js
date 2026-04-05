@@ -814,61 +814,48 @@ app.all("*", async (req, res) => {
       // ==========================================================
       // --- Ib. HAPUS SEMUA IKLAN / ADS SCRIPTS & REDIRECTS ---
       // ==========================================================
+      // IMPORTANT: Use [^<]*(?:<(?!\/script>)[^<]*)* instead of [\s\S]*?
+      // to avoid matching across </script> boundaries which breaks legit scripts.
+      const SCRIPT_INNER = '[^<]*(?:<(?!\\/script>)[^<]*)*';
 
-      // 1. Hapus script src yang mengandung pola iklan (data.komiku.org/iklan, ads.js, pop-up, popunder, dll)
+      // 1. Hapus script src yang mengandung pola iklan spesifik
       html = html.replace(
-        /<script[^>]*src=["'][^"']*(?:\/iklan\/|\/ads\/|ads\.js|ads\.php|iklan\.php|pop-up|popunder|popads|adserver|adsterra|juicyads|exoclick|trafficjunky|clickadu|propellerads|monetag|galaksion|hilltopads|a]?-?ads)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi,
+        /<script[^>]*src=["'][^"']*(?:\/iklan\/|iklan\.php|ads\.php|pop-up\/ads|popunder|popads|adsterra|juicyads|exoclick|trafficjunky|clickadu|propellerads|monetag|galaksion|hilltopads)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi,
         "<!-- ad removed -->"
       );
 
-      // 2. Hapus script inline yang load iklan (data.komiku.org/iklan, ads/pop-up, is_subscribed pattern)
-      html = html.replace(
-        /<script[^>]*>[\s\S]*?(?:data\.komiku\.org\/iklan|\/iklan\/foot\/|\/ads\/pop-up\/|is_subscribed)[\s\S]*?<\/script>/gi,
-        "<!-- ad removed -->"
-      );
-
-      // 3. Hapus script src dari data.komiku.org (semua — biasanya iklan)
+      // 2. Hapus script src dari data.komiku.org (iklan server)
       html = html.replace(
         /<script[^>]*src=["'][^"']*data\.komiku\.org[^"']*["'][^>]*>[\s\S]*?<\/script>/gi,
         "<!-- ad removed -->"
       );
 
-      // 4. Hapus script inline yang buat script element baru untuk load iklan (document.createElement('script') + iklan/ads URL)
+      // 3. Hapus inline script yang contain is_subscribed + iklan loader (spesifik pattern dari origin)
       html = html.replace(
-        /<script[^>]*>[\s\S]*?createElement\s*\(\s*['"]script['"]\s*\)[\s\S]*?(?:iklan|\/ads\/|ads\.js|ads\.php|popunder|pop-up)[\s\S]*?<\/script>/gi,
+        new RegExp(`<script[^>]*>(?:${SCRIPT_INNER})is_subscribed(?:${SCRIPT_INNER})(?:iklan|ads\\.js|ads\\.php|pop-up)(?:${SCRIPT_INNER})<\\/script>`, "gi"),
         "<!-- ad removed -->"
       );
 
-      // 5. Hapus script inline window.open / window.location redirect ads
+      // 4. Hapus iframe iklan
       html = html.replace(
-        /<script[^>]*>[\s\S]*?(?:window\.open\s*\(|window\.location\s*=)[\s\S]*?<\/script>/gi,
+        /<iframe[^>]*src=["'][^"']*(?:popunder|adserver|doubleclick|googlesyndication)[^"']*["'][^>]*>[\s\S]*?<\/iframe>/gi,
         "<!-- ad removed -->"
       );
 
-      // 6. Hapus iframe iklan (biasanya hidden/small iframe untuk tracking)
-      html = html.replace(
-        /<iframe[^>]*src=["'][^"']*(?:ads|iklan|popunder|adserver|doubleclick|googlesyndication)[^"']*["'][^>]*>[\s\S]*?<\/iframe>/gi,
-        "<!-- ad removed -->"
-      );
-
-      // 7. Hapus div/container iklan umum
-      html = html.replace(
-        /<div[^>]*(?:id|class)=["'][^"']*(?:ads-container|ad-slot|iklan-|popup-ads|interstitial)[^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
-        "<!-- ad removed -->"
-      );
-
-      // 8. Inject script untuk block runtime ad injection & tab redirect
+      // 5. Inject script untuk block runtime ad injection & tab redirect
       const adBlockScript = `
         <script id="mirror-adblock">
         (function(){
-          // Block window.open (prevents popup/redirect ads)
+          // Override is_subscribed to true so ad-loading code thinks user is subscribed
+          try { localStorage.setItem('is_subscribed', 'true'); } catch(e) {}
+
+          // Block window.open to external domains (prevents popup/redirect ads)
           var _origOpen = window.open;
           window.open = function(url) {
             if(url && typeof url === 'string') {
               try {
                 var u = new URL(url, location.href);
-                var dominated = location.hostname;
-                if(u.hostname === dominated || u.hostname.endsWith('.'+dominated)) {
+                if(u.hostname === location.hostname || u.hostname.endsWith('.'+location.hostname)) {
                   return _origOpen.apply(window, arguments);
                 }
               } catch(e) {}
@@ -877,47 +864,35 @@ app.all("*", async (req, res) => {
             return null;
           };
 
-          // Block createElement for ad scripts
+          // Intercept dynamic script creation — block ad scripts only
           var _origCreate = document.createElement.bind(document);
+          var adPattern = /iklan|pop-up\\/ads|popunder|adsterra|juicyads|exoclick|clickadu|propellerads|monetag|galaksion|data\\.komiku\\.org\\/iklan/i;
           document.createElement = function(tag) {
             var el = _origCreate(tag);
             if (tag.toLowerCase() === 'script') {
-              var _origSetAttr = el.setAttribute.bind(el);
-              var _origSrcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+              var _srcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
               Object.defineProperty(el, 'src', {
                 set: function(v) {
-                  if (typeof v === 'string' && /iklan|ads\\.js|ads\\.php|pop-up|popunder|adserver|adsterra|juicyads|exoclick|clickadu|propellerads|monetag|galaksion|data\\.komiku\\.org/i.test(v)) {
+                  if (typeof v === 'string' && adPattern.test(v)) {
                     console.log('[AdBlock] Blocked script:', v);
                     return;
                   }
-                  _origSrcDesc.set.call(this, v);
+                  _srcDesc.set.call(this, v);
                 },
-                get: function() { return _origSrcDesc.get.call(this); }
+                get: function() { return _srcDesc.get.call(this); }
               });
             }
             return el;
           };
 
-          // Override is_subscribed to true so ad-loading code thinks user is subscribed
-          try { localStorage.setItem('is_subscribed', 'true'); } catch(e) {}
-
-          // Block addEventListener for beforeunload ad hijacks
-          var _origAddEL = EventTarget.prototype.addEventListener;
-          EventTarget.prototype.addEventListener = function(type, fn, opts) {
-            if (type === 'beforeunload' || type === 'unload') {
-              return;
-            }
-            return _origAddEL.call(this, type, fn, opts);
-          };
-
-          // Periodic cleanup: remove injected ad iframes and scripts
+          // Periodic cleanup: remove ad iframes/scripts injected at runtime
           function cleanAds() {
-            document.querySelectorAll('iframe[src*="ads"], iframe[src*="iklan"], iframe[src*="popunder"], script[src*="iklan"], script[src*="ads.js"], script[src*="ads.php"], script[src*="pop-up"], script[src*="data.komiku.org"]').forEach(function(el) {
+            document.querySelectorAll('script[src*="iklan"], script[src*="pop-up/ads"], script[src*="data.komiku.org/iklan"], iframe[src*="popunder"], iframe[src*="adserver"]').forEach(function(el) {
               el.remove();
             });
           }
           if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',cleanAds);}else{cleanAds();}
-          setInterval(cleanAds, 2000);
+          setInterval(cleanAds, 3000);
         })();
         </script>`;
 
