@@ -21,6 +21,8 @@ app.set("trust proxy", true);
 // ============================================================
 const ORIGIN_HOST = process.env.ORIGIN_HOST || "komiku.org";
 const MIRROR_HOST = process.env.MIRROR_HOST || "komiku.io";
+// Fallback origins when primary is blocked by DDoS-Guard
+const FALLBACK_ORIGINS = (process.env.FALLBACK_ORIGINS || "secure.komikid.org").split(",").map(s => s.trim()).filter(Boolean);
 const SITE_NAME = process.env.SITE_NAME || "Komiku";
 const SITE_TAGLINE = process.env.SITE_TAGLINE || "Baca Komik Manga Manhwa Manhua Bahasa Indonesia";
 const SITE_DESCRIPTION = process.env.SITE_DESCRIPTION || "Komiku.io — Situs baca komik manga, manhwa, dan manhua sub Indonesia terlengkap dan terupdate. Gratis tanpa iklan.";
@@ -75,6 +77,27 @@ let directBlocked = false; // true if direct connection has been blocked by DDoS
 let directBlockedAt = 0;
 const DIRECT_RETRY_INTERVAL = 5 * 60 * 1000; // retry direct every 5 minutes
 
+// --- DDoS-Guard cookie jar (persist cookies across requests) ---
+let ddosGuardCookies = {};
+function parseDdosGuardCookies(response) {
+  const setCookies = response.headers.raw()["set-cookie"] || [];
+  for (const cookie of setCookies) {
+    const match = cookie.match(/^([^=]+)=([^;]+)/);
+    if (match && match[1].startsWith("__ddg")) {
+      ddosGuardCookies[match[1]] = match[2];
+    }
+  }
+}
+function getDdosGuardCookieHeader() {
+  const entries = Object.entries(ddosGuardCookies);
+  if (entries.length === 0) return "";
+  return entries.map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+// --- Track which origin is currently working ---
+let currentWorkingOrigin = ORIGIN_HOST;
+let originBlockedMap = new Map(); // origin → timestamp of last block
+
 function getNextProxy() {
   if (proxyList.length === 0) return null;
   const proxy = proxyList[proxyIndex % proxyList.length];
@@ -82,15 +105,35 @@ function getNextProxy() {
   return proxy;
 }
 
-// --- DDoS-Guard detection ---
+// --- DDoS-Guard detection (extended: JS challenges, captcha, block pages) ---
+// IMPORTANT: Only detects actual DDoS-Guard BLOCK/CHALLENGE pages, not valid pages
+// that merely include a DDoS-Guard monitoring script (.well-known/ddos-guard/check)
 function isDdosGuardBlock(body) {
   if (!body || typeof body !== "string") return false;
-  return (
-    body.includes("ddos-guard") ||
-    body.includes("DDoS-Guard") ||
+  // Valid pages with content are never challenge pages (> 10KB = real content)
+  if (body.length > 10000) return false;
+  // Check for block/challenge page indicators (only relevant for small pages)
+  if (
     body.includes("is not available") ||
     body.includes("restricted access from your current IP")
-  );
+  ) return true;
+  // JS challenge page detection (small page with JS redirect/cookie setting)
+  if (body.length < 5000 && (
+    body.includes("check_js") ||
+    (body.includes("document.cookie") && body.includes("location.reload"))
+  )) return true;
+  return false;
+}
+
+// --- Check if response looks like a valid content page (not a challenge) ---
+function isValidContentResponse(response, body) {
+  const ct = response.headers.get("content-type") || "";
+  const server = response.headers.get("server") || "";
+  // DDoS-Guard challenge pages are usually very small HTML
+  if (ct.includes("text/html") && body && body.length < 3000 && server.toLowerCase().includes("ddos-guard")) {
+    return false;
+  }
+  return true;
 }
 
 // --- In-memory response cache ---
@@ -127,9 +170,84 @@ function setCache(key, data) {
   responseCache.set(key, { ...data, ts: Date.now() });
 }
 
-// --- Fetch with smart strategy: direct-first, proxy on block ---
+// --- Fetch with smart strategy: direct-first, proxy on block, fallback origins ---
 const MAX_RETRIES = parseInt(process.env.PROXY_MAX_RETRIES, 10) || 3;
-const FETCH_TIMEOUT = parseInt(process.env.FETCH_TIMEOUT, 10) || 15000;
+const FETCH_TIMEOUT = parseInt(process.env.FETCH_TIMEOUT, 10) || 12000;
+const PROXY_TIMEOUT = parseInt(process.env.PROXY_TIMEOUT, 10) || 8000; // shorter for proxy attempts
+
+// Helper: check response for DDoS-Guard block (supports 403 AND 200 JS challenge)
+// Returns { blocked, body } — body is pre-read ONLY when DDoS-Guard check is needed
+async function checkDdosGuardResponse(response) {
+  const ct = response.headers.get("content-type") || "";
+  if (!ct.includes("text/html")) return { blocked: false, body: null };
+
+  const server = response.headers.get("server") || "";
+  const isDdosGuardServer = server.toLowerCase().includes("ddos-guard");
+
+  // Only read body when we need to check: 403 responses or DDoS-Guard server
+  if (response.status === 403 || isDdosGuardServer) {
+    const body = await response.text();
+
+    // Check 403 blocks
+    if (response.status === 403 && isDdosGuardBlock(body)) {
+      return { blocked: true, body };
+    }
+
+    // Check 200 JS challenge pages
+    if (response.status === 200 && isDdosGuardServer) {
+      parseDdosGuardCookies(response);
+      if (isDdosGuardBlock(body) || !isValidContentResponse(response, body)) {
+        return { blocked: true, body };
+      }
+    }
+
+    // Body was read but content is valid — return it for reuse
+    return { blocked: false, body };
+  }
+
+  // No DDoS-Guard involvement — don't consume body
+  return { blocked: false, body: null };
+}
+
+// Inject DDoS-Guard cookies into request options
+function injectDdosGuardCookies(options) {
+  const cookieHeader = getDdosGuardCookieHeader();
+  if (cookieHeader) {
+    options.headers = options.headers || {};
+    const existing = options.headers["Cookie"] || options.headers["cookie"] || "";
+    options.headers["Cookie"] = existing ? `${existing}; ${cookieHeader}` : cookieHeader;
+  }
+  return options;
+}
+
+async function fetchSingleAttempt(url, options, agent) {
+  const fetchOpts = agent ? { ...options, agent } : { ...options };
+  injectDdosGuardCookies(fetchOpts);
+
+  const controller = new AbortController();
+  const timeout = agent ? (PROXY_TIMEOUT) : (fetchOpts.timeout || FETCH_TIMEOUT);
+  delete fetchOpts.timeout; // remove custom timeout, use AbortController instead
+  fetchOpts.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, fetchOpts);
+    clearTimeout(timer);
+
+    // Parse DDoS-Guard cookies from every response
+    parseDdosGuardCookies(response);
+
+    const check = await checkDdosGuardResponse(response);
+    if (check.blocked) {
+      return { success: false, blocked: true };
+    }
+    // Return pre-read body if available (for HTML), avoids double-read issues
+    return { success: true, response, preReadBody: check.body };
+  } catch (err) {
+    clearTimeout(timer);
+    return { success: false, blocked: false, error: err };
+  }
+}
 
 async function fetchWithProxy(url, options = {}) {
   let lastError;
@@ -137,92 +255,117 @@ async function fetchWithProxy(url, options = {}) {
   // Set default timeout if not specified
   if (!options.timeout) options.timeout = FETCH_TIMEOUT;
 
+  // Determine the requested origin host from the URL
+  const parsedUrl = new URL(url);
+  const isMainOrigin = parsedUrl.hostname === ORIGIN_HOST || parsedUrl.hostname === `www.${ORIGIN_HOST}`;
+
+  // Helper: attach pre-read body to response for reuse
+  function attachPreReadBody(result) {
+    if (result.preReadBody !== null && result.preReadBody !== undefined) {
+      result.response._preReadBody = result.preReadBody;
+    }
+    return result.response;
+  }
+
   // === STRATEGY 1: Try direct connection first (fastest) ===
   const shouldTryDirect = !directBlocked || (Date.now() - directBlockedAt > DIRECT_RETRY_INTERVAL);
 
   if (shouldTryDirect) {
-    try {
-      const response = await fetch(url, options);
-
-      // Check for DDoS-Guard block on HTML responses
-      const ct = response.headers.get("content-type") || "";
-      if (ct.includes("text/html") && response.status === 403) {
-        const cloned = response.clone();
-        const text = await cloned.text();
-        if (isDdosGuardBlock(text)) {
-          console.warn("⛔ Direct connection blocked by DDoS-Guard, switching to proxy...");
-          directBlocked = true;
-          directBlockedAt = Date.now();
-          // Fall through to proxy strategy
-        } else {
-          directBlocked = false;
-          return response;
-        }
-      } else {
-        directBlocked = false;
-        return response;
-      }
-    } catch (err) {
-      console.warn(`❌ Direct fetch failed: ${err.message}, trying proxy...`);
+    const result = await fetchSingleAttempt(url, options);
+    if (result.success) {
+      directBlocked = false;
+      currentWorkingOrigin = ORIGIN_HOST;
+      return attachPreReadBody(result);
+    }
+    if (result.blocked) {
+      console.warn("⛔ Direct connection blocked by DDoS-Guard, trying alternatives...");
+      directBlocked = true;
+      directBlockedAt = Date.now();
+    } else if (result.error) {
+      console.warn(`❌ Direct fetch failed: ${result.error.message}, trying alternatives...`);
     }
   }
 
   // === STRATEGY 2: Use last working proxy first ===
   if (lastWorkingProxy && proxyList.length > 0) {
-    try {
-      const agent = getProxyAgent(lastWorkingProxy);
-      const fetchOpts = { ...options, agent };
-      const response = await fetch(url, fetchOpts);
-
-      const ct = response.headers.get("content-type") || "";
-      if (ct.includes("text/html") && response.status === 403) {
-        const cloned = response.clone();
-        const text = await cloned.text();
-        if (isDdosGuardBlock(text)) {
-          lastWorkingProxy = null; // This proxy is now blocked too
-        } else {
-          return response;
-        }
-      } else {
-        return response;
-      }
-    } catch (err) {
+    const agent = getProxyAgent(lastWorkingProxy);
+    const result = await fetchSingleAttempt(url, options, agent);
+    if (result.success) return attachPreReadBody(result);
+    if (result.blocked || result.error) {
       lastWorkingProxy = null;
     }
   }
 
-  // === STRATEGY 3: Rotate through other proxies ===
-  for (let attempt = 0; attempt < Math.min(MAX_RETRIES, proxyList.length); attempt++) {
+  // === STRATEGY 3: Rotate through other proxies (limit attempts since they may share IPs) ===
+  const proxyAttempts = Math.min(MAX_RETRIES, proxyList.length, 2); // max 2 to avoid long wait
+  for (let attempt = 0; attempt < proxyAttempts; attempt++) {
     const proxyUrl = getNextProxy();
-
-    try {
-      const agent = getProxyAgent(proxyUrl);
-      const fetchOpts = { ...options, agent };
-      const response = await fetch(url, fetchOpts);
-
-      const ct = response.headers.get("content-type") || "";
-      if (ct.includes("text/html") && response.status === 403) {
-        const cloned = response.clone();
-        const text = await cloned.text();
-        if (isDdosGuardBlock(text)) {
-          const label = proxyUrl.replace(/:[^:@]*@/, ":***@");
-          console.warn(`⛔ Proxy ${label} blocked (attempt ${attempt + 1}), next...`);
-          lastError = new Error("DDoS-Guard block");
-          continue;
-        }
-      }
-
-      // This proxy works!
+    const agent = getProxyAgent(proxyUrl);
+    const result = await fetchSingleAttempt(url, options, agent);
+    if (result.success) {
       lastWorkingProxy = proxyUrl;
-      return response;
-    } catch (err) {
-      const label = proxyUrl.replace(/:[^:@]*@/, ":***@");
-      console.warn(`❌ Proxy ${label} failed (attempt ${attempt + 1}): ${err.message}`);
-      lastError = err;
+      return attachPreReadBody(result);
+    }
+    const label = proxyUrl.replace(/:[^:@]*@/, ":***@");
+    if (result.blocked) {
+      console.warn(`⛔ Proxy ${label} blocked (attempt ${attempt + 1}), next...`);
+      lastError = new Error("DDoS-Guard block");
+    } else {
+      console.warn(`❌ Proxy ${label} failed (attempt ${attempt + 1}): ${result.error?.message}`);
+      lastError = result.error;
     }
   }
 
-  throw lastError || new Error("All fetch attempts failed");
+  // === STRATEGY 4: Try fallback origins (e.g. secure.komikid.org) ===
+  if (isMainOrigin && FALLBACK_ORIGINS.length > 0) {
+    for (const fallbackHost of FALLBACK_ORIGINS) {
+      // Skip if this fallback was recently blocked
+      const blockedAt = originBlockedMap.get(fallbackHost);
+      if (blockedAt && Date.now() - blockedAt < DIRECT_RETRY_INTERVAL) continue;
+
+      const fallbackUrl = url.replace(
+        new RegExp(`https?://(www\\.)?${escapeRegex(ORIGIN_HOST)}`, "i"),
+        `https://${fallbackHost}`
+      );
+
+      console.log(`🔄 Trying fallback origin: ${fallbackHost}...`);
+
+      // Build options with correct Host header for fallback
+      const fallbackOptions = { ...options };
+      fallbackOptions.headers = { ...options.headers, Host: fallbackHost };
+
+      // Try direct to fallback
+      const result = await fetchSingleAttempt(fallbackUrl, fallbackOptions);
+      if (result.success) {
+        console.log(`✅ Fallback origin ${fallbackHost} is working!`);
+        currentWorkingOrigin = fallbackHost;
+        originBlockedMap.delete(fallbackHost);
+        return attachPreReadBody(result);
+      }
+
+      if (result.blocked) {
+        console.warn(`⛔ Fallback ${fallbackHost} also blocked by DDoS-Guard`);
+        originBlockedMap.set(fallbackHost, Date.now());
+      } else {
+        console.warn(`❌ Fallback ${fallbackHost} failed: ${result.error?.message}`);
+      }
+
+      // Try fallback through proxies
+      for (let attempt = 0; attempt < Math.min(2, proxyList.length); attempt++) {
+        const proxyUrl = getNextProxy();
+        const agent = getProxyAgent(proxyUrl);
+        const proxyResult = await fetchSingleAttempt(fallbackUrl, fallbackOptions, agent);
+        if (proxyResult.success) {
+          console.log(`✅ Fallback ${fallbackHost} via proxy is working!`);
+          currentWorkingOrigin = fallbackHost;
+          lastWorkingProxy = proxyUrl;
+          return attachPreReadBody(proxyResult);
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("All fetch attempts failed (direct + proxy + fallback origins)");
 }
 
 // ============================================================
@@ -280,7 +423,9 @@ app.get("/healthz", (req, res) => {
     status: "ok",
     timestamp: Date.now(),
     cache: { entries: responseCache.size, maxEntries: CACHE_MAX_ENTRIES },
-    proxy: { total: proxyList.length, directBlocked },
+    proxy: { total: proxyList.length, directBlocked, lastWorkingProxy: !!lastWorkingProxy },
+    origin: { primary: ORIGIN_HOST, current: currentWorkingOrigin, fallbacks: FALLBACK_ORIGINS },
+    ddosGuardCookies: Object.keys(ddosGuardCookies).length,
   });
 });
 
@@ -694,14 +839,15 @@ app.all("*", async (req, res) => {
     }
   }
 
-  // Build origin URL
-  const originUrl = `https://${ORIGIN_HOST}${pathname}`;
+  // Build origin URL — use current working origin (may be fallback)
+  const useOrigin = currentWorkingOrigin || ORIGIN_HOST;
+  const originUrl = `https://${useOrigin}${pathname}`;
 
   // ============================
   // 1. BUILD REQUEST KE ORIGIN
   // ============================
   const proxyHeaders = {
-    Host: ORIGIN_HOST,
+    Host: useOrigin,
     "X-Forwarded-Host": mirrorHost,
     "User-Agent":
       req.get("user-agent") ||
@@ -709,7 +855,7 @@ app.all("*", async (req, res) => {
     Accept: req.get("accept") || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate",
-    Referer: `https://${ORIGIN_HOST}/`,
+    Referer: `https://${useOrigin}/`,
   };
 
   // Forward cookie jika ada (untuk fungsionalitas)
@@ -776,7 +922,8 @@ app.all("*", async (req, res) => {
     // 3A. PROSES HTML
     // ============================
     if (contentType.includes("text/html")) {
-      let html = await response.text();
+      // Use pre-read body if available (avoids node-fetch clone/double-read deadlock)
+      let html = response._preReadBody || await response.text();
       const reqPathname = req.path;
       const canonicalUrl = `https://${mirrorHost}${reqPathname}`;
       const pageId = uniquePageId(reqPathname);
@@ -794,8 +941,16 @@ app.all("*", async (req, res) => {
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
       // A3. Rewrite domain alternatif (secure.komikid.org, komikid.org)
       html = html.replace(/https?:\/\/(www\.)?(secure\.)?komikid\.org/gi, `https://${mirrorHost}`);
+      // A3b. Rewrite current fallback origin if different from primary
+      if (useOrigin !== ORIGIN_HOST) {
+        html = html.replace(new RegExp(`https?://(www\\.)?${escapeRegex(useOrigin)}`, "gi"), `https://${mirrorHost}`);
+      }
       // A4. Rewrite plain-text domain origin (placeholder, title, dsb)
       html = html.replace(new RegExp(`(["'])${escapeRegex(ORIGIN_HOST)}(["'])`, "gi"), `$1${mirrorHost}$2`);
+      // A5. Rewrite protocol-relative URLs (//komiku.org/...)
+      html = html.replace(new RegExp(`//${escapeRegex(ORIGIN_HOST)}`, "gi"), `//${mirrorHost}`);
+      // A6. Rewrite JSON-escaped URLs (\\/\\/komiku.org in JSON-LD script blocks)
+      html = html.replace(new RegExp(`\\\\/\\\\/${escapeRegex(ORIGIN_HOST)}`, "gi"), `\\/\\/${mirrorHost}`);
 
       // --- B. HAPUS SEMUA CANONICAL LAMA & INJECT CANONICAL BARU ---
       html = html.replace(/<link[^>]*rel=["']canonical["'][^>]*\/?>/gi, "");
@@ -1620,6 +1775,10 @@ app.all("*", async (req, res) => {
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
+      // Protocol-relative URLs
+      html = html.replace(new RegExp(`//${escapeRegex(ORIGIN_HOST)}`, "gi"), `//${mirrorHost}`);
+      // JSON-escaped URLs
+      html = html.replace(new RegExp(`\\\\/\\\\/${escapeRegex(ORIGIN_HOST)}`, "gi"), `\\/\\/${mirrorHost}`);
 
       // Hapus komentar HTML yg bisa bocorkan origin
       html = html.replace(/<!--[\s\S]*?-->/g, (match) => {
@@ -1721,8 +1880,51 @@ app.all("*", async (req, res) => {
     res.status(response.status);
     response.body.pipe(res);
   } catch (err) {
-    console.error("Proxy error:", err.message, "URL:", req.originalUrl);
-    res.status(502).send("Bad Gateway — Origin unreachable");
+    console.error("Proxy error:", err.message, "URL:", req.originalUrl, "Origin:", useOrigin);
+    const errorHtml = `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${SITE_NAME} — Sedang Memuat...</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f6fa; display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #1e293b; }
+    .container { text-align: center; max-width: 480px; padding: 40px 24px; }
+    .icon { font-size: 64px; margin-bottom: 16px; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+    p { font-size: 14px; color: #64748b; margin-bottom: 20px; line-height: 1.6; }
+    .retry-info { font-size: 13px; color: #94a3b8; margin-top: 16px; }
+    .retry-btn { display: inline-block; padding: 12px 32px; background: #3b5fd9; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; text-decoration: none; transition: background 0.2s; }
+    .retry-btn:hover { background: #2d4bb8; }
+    .spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #e2e8f0; border-top-color: #3b5fd9; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #countdown { font-weight: 600; color: #3b5fd9; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">🔄</div>
+    <h1>Sedang Menghubungkan ke Server</h1>
+    <p>Server origin sedang dalam proses koneksi ulang. Halaman akan dimuat ulang otomatis.</p>
+    <a class="retry-btn" href="javascript:location.reload()"><span class="spinner"></span>Muat Ulang Sekarang</a>
+    <div class="retry-info">Auto-refresh dalam <span id="countdown">5</span> detik...</div>
+  </div>
+  <script>
+    var c = 5;
+    var el = document.getElementById('countdown');
+    var t = setInterval(function() {
+      c--;
+      if (el) el.textContent = c;
+      if (c <= 0) { clearInterval(t); location.reload(); }
+    }, 1000);
+  </script>
+</body>
+</html>`;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("Cache-Control", "no-cache, no-store");
+    res.set("Retry-After", "5");
+    res.status(502).send(errorHtml);
   }
 });
 
@@ -1732,9 +1934,10 @@ app.all("*", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ ${SITE_NAME} Mirror running on port ${PORT}`);
   console.log(`   Origin: ${ORIGIN_HOST}`);
+  console.log(`   Fallbacks: ${FALLBACK_ORIGINS.length > 0 ? FALLBACK_ORIGINS.join(", ") : "(none)"}`);
   console.log(`   Mirror: ${MIRROR_HOST || "(auto-detect from Host header)"}`);
   console.log(`   Env: ${process.env.NODE_ENV || "development"}`);
   console.log(`   Cache: max ${CACHE_MAX_ENTRIES} entries, HTML ${CACHE_TTL_HTML / 1000}s / Asset ${CACHE_TTL_ASSET / 1000}s / Image ${CACHE_TTL_IMAGE / 1000}s`);
-  console.log(`   Strategy: direct-first → last-working-proxy → rotate`);
+  console.log(`   Strategy: direct-first → last-working-proxy → rotate → fallback origins`);
   console.log(`   Health: http://0.0.0.0:${PORT}/healthz`);
 });
