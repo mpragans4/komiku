@@ -43,11 +43,9 @@ function loadProxies() {
       .map((line) => {
         const parts = line.split(":");
         if (parts.length === 4) {
-          // ip:port:user:pass
           const [host, port, user, pass] = parts;
           return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
         } else if (parts.length === 2) {
-          // ip:port (no auth)
           return `http://${parts[0]}:${parts[1]}`;
         }
         return null;
@@ -61,6 +59,22 @@ function loadProxies() {
 }
 loadProxies();
 
+// --- Proxy agent pool (reuse agents to avoid reconnect overhead) ---
+const proxyAgentPool = new Map();
+function getProxyAgent(proxyUrl) {
+  if (!proxyUrl) return undefined;
+  if (!proxyAgentPool.has(proxyUrl)) {
+    proxyAgentPool.set(proxyUrl, new HttpsProxyAgent(proxyUrl));
+  }
+  return proxyAgentPool.get(proxyUrl);
+}
+
+// --- Track last working proxy to prefer it ---
+let lastWorkingProxy = null;
+let directBlocked = false; // true if direct connection has been blocked by DDoS-Guard
+let directBlockedAt = 0;
+const DIRECT_RETRY_INTERVAL = 5 * 60 * 1000; // retry direct every 5 minutes
+
 function getNextProxy() {
   if (proxyList.length === 0) return null;
   const proxy = proxyList[proxyIndex % proxyList.length];
@@ -68,12 +82,7 @@ function getNextProxy() {
   return proxy;
 }
 
-function createProxyAgent(proxyUrl) {
-  if (!proxyUrl) return undefined;
-  return new HttpsProxyAgent(proxyUrl);
-}
-
-// DDoS-Guard detection
+// --- DDoS-Guard detection ---
 function isDdosGuardBlock(body) {
   if (!body || typeof body !== "string") return false;
   return (
@@ -84,57 +93,136 @@ function isDdosGuardBlock(body) {
   );
 }
 
-// Fetch with proxy rotation and retry on DDoS-Guard block
-const MAX_RETRIES = parseInt(process.env.PROXY_MAX_RETRIES, 10) || 5;
+// --- In-memory response cache ---
+const CACHE_MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES, 10) || 500;
+const CACHE_TTL_HTML = parseInt(process.env.CACHE_TTL_HTML, 10) || 60 * 1000;       // 60s for HTML
+const CACHE_TTL_ASSET = parseInt(process.env.CACHE_TTL_ASSET, 10) || 300 * 1000;    // 5min for CSS/JS
+const CACHE_TTL_IMAGE = parseInt(process.env.CACHE_TTL_IMAGE, 10) || 600 * 1000;    // 10min for images
+const responseCache = new Map();
+
+function getCacheTTL(contentType) {
+  if (!contentType) return CACHE_TTL_HTML;
+  if (contentType.includes("text/html")) return CACHE_TTL_HTML;
+  if (contentType.includes("image/")) return CACHE_TTL_IMAGE;
+  if (contentType.includes("text/css") || contentType.includes("javascript")) return CACHE_TTL_ASSET;
+  return CACHE_TTL_HTML;
+}
+
+function getCached(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > entry.ttl) {
+    responseCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function setCache(key, data) {
+  // Evict oldest entries if cache is full
+  if (responseCache.size >= CACHE_MAX_ENTRIES) {
+    const firstKey = responseCache.keys().next().value;
+    responseCache.delete(firstKey);
+  }
+  responseCache.set(key, { ...data, ts: Date.now() });
+}
+
+// --- Fetch with smart strategy: direct-first, proxy on block ---
+const MAX_RETRIES = parseInt(process.env.PROXY_MAX_RETRIES, 10) || 3;
+const FETCH_TIMEOUT = parseInt(process.env.FETCH_TIMEOUT, 10) || 15000;
 
 async function fetchWithProxy(url, options = {}) {
   let lastError;
-  const triedProxies = new Set();
 
-  for (let attempt = 0; attempt < Math.min(MAX_RETRIES, proxyList.length || 1); attempt++) {
-    const proxyUrl = getNextProxy();
-    if (proxyUrl && triedProxies.has(proxyUrl)) continue;
-    if (proxyUrl) triedProxies.add(proxyUrl);
+  // Set default timeout if not specified
+  if (!options.timeout) options.timeout = FETCH_TIMEOUT;
 
-    const agent = createProxyAgent(proxyUrl);
-    const fetchOpts = { ...options };
-    if (agent) fetchOpts.agent = agent;
+  // === STRATEGY 1: Try direct connection first (fastest) ===
+  const shouldTryDirect = !directBlocked || (Date.now() - directBlockedAt > DIRECT_RETRY_INTERVAL);
 
+  if (shouldTryDirect) {
     try {
-      const response = await fetch(url, fetchOpts);
+      const response = await fetch(url, options);
 
-      // For HTML responses, check if DDoS-Guard blocked us
+      // Check for DDoS-Guard block on HTML responses
       const ct = response.headers.get("content-type") || "";
       if (ct.includes("text/html") && response.status === 403) {
         const cloned = response.clone();
         const text = await cloned.text();
         if (isDdosGuardBlock(text)) {
-          const proxyLabel = proxyUrl ? proxyUrl.replace(/:[^:@]*@/, ":***@") : "direct";
-          console.warn(`⛔ DDoS-Guard block detected (attempt ${attempt + 1}, proxy: ${proxyLabel}), retrying...`);
+          console.warn("⛔ Direct connection blocked by DDoS-Guard, switching to proxy...");
+          directBlocked = true;
+          directBlockedAt = Date.now();
+          // Fall through to proxy strategy
+        } else {
+          directBlocked = false;
+          return response;
+        }
+      } else {
+        directBlocked = false;
+        return response;
+      }
+    } catch (err) {
+      console.warn(`❌ Direct fetch failed: ${err.message}, trying proxy...`);
+    }
+  }
+
+  // === STRATEGY 2: Use last working proxy first ===
+  if (lastWorkingProxy && proxyList.length > 0) {
+    try {
+      const agent = getProxyAgent(lastWorkingProxy);
+      const fetchOpts = { ...options, agent };
+      const response = await fetch(url, fetchOpts);
+
+      const ct = response.headers.get("content-type") || "";
+      if (ct.includes("text/html") && response.status === 403) {
+        const cloned = response.clone();
+        const text = await cloned.text();
+        if (isDdosGuardBlock(text)) {
+          lastWorkingProxy = null; // This proxy is now blocked too
+        } else {
+          return response;
+        }
+      } else {
+        return response;
+      }
+    } catch (err) {
+      lastWorkingProxy = null;
+    }
+  }
+
+  // === STRATEGY 3: Rotate through other proxies ===
+  for (let attempt = 0; attempt < Math.min(MAX_RETRIES, proxyList.length); attempt++) {
+    const proxyUrl = getNextProxy();
+
+    try {
+      const agent = getProxyAgent(proxyUrl);
+      const fetchOpts = { ...options, agent };
+      const response = await fetch(url, fetchOpts);
+
+      const ct = response.headers.get("content-type") || "";
+      if (ct.includes("text/html") && response.status === 403) {
+        const cloned = response.clone();
+        const text = await cloned.text();
+        if (isDdosGuardBlock(text)) {
+          const label = proxyUrl.replace(/:[^:@]*@/, ":***@");
+          console.warn(`⛔ Proxy ${label} blocked (attempt ${attempt + 1}), next...`);
           lastError = new Error("DDoS-Guard block");
           continue;
         }
       }
 
+      // This proxy works!
+      lastWorkingProxy = proxyUrl;
       return response;
     } catch (err) {
-      const proxyLabel = proxyUrl ? proxyUrl.replace(/:[^:@]*@/, ":***@") : "direct";
-      console.warn(`❌ Fetch failed (attempt ${attempt + 1}, proxy: ${proxyLabel}): ${err.message}`);
+      const label = proxyUrl.replace(/:[^:@]*@/, ":***@");
+      console.warn(`❌ Proxy ${label} failed (attempt ${attempt + 1}): ${err.message}`);
       lastError = err;
     }
   }
 
-  // All retries exhausted — try once without proxy as last resort if proxies were used
-  if (proxyList.length > 0) {
-    try {
-      console.warn("🔄 All proxies failed, trying direct connection...");
-      return await fetch(url, options);
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  throw lastError || new Error("All proxy attempts failed");
+  throw lastError || new Error("All fetch attempts failed");
 }
 
 // ============================================================
@@ -188,7 +276,12 @@ app.use((req, res, next) => {
 // HEALTH CHECK ENDPOINT (untuk Railway)
 // ============================================================
 app.get("/healthz", (req, res) => {
-  res.status(200).json({ status: "ok", timestamp: Date.now() });
+  res.status(200).json({
+    status: "ok",
+    timestamp: Date.now(),
+    cache: { entries: responseCache.size, maxEntries: CACHE_MAX_ENTRIES },
+    proxy: { total: proxyList.length, directBlocked },
+  });
 });
 
 // ============================================================
@@ -586,6 +679,21 @@ app.all("*", async (req, res) => {
   const mirrorHost = getMirrorHost(req);
   const pathname = req.originalUrl; // includes query string
 
+  // ============================
+  // 0. CHECK IN-MEMORY CACHE (GET only)
+  // ============================
+  const cacheKey = pathname;
+  if (req.method === "GET") {
+    const cached = getCached(cacheKey);
+    if (cached) {
+      for (const [k, v] of Object.entries(cached.headers || {})) {
+        res.set(k, v);
+      }
+      res.set("X-Cache", "HIT");
+      return res.status(cached.status).send(cached.body);
+    }
+  }
+
   // Build origin URL
   const originUrl = `https://${ORIGIN_HOST}${pathname}`;
 
@@ -614,7 +722,6 @@ app.all("*", async (req, res) => {
       method: req.method,
       headers: proxyHeaders,
       redirect: "manual",
-      timeout: 30000,
     };
 
     // Forward body untuk POST/PUT
@@ -1524,7 +1631,19 @@ app.all("*", async (req, res) => {
       res.set("Content-Type", "text/html; charset=utf-8");
       res.set("X-Robots-Tag", "index, follow");
       res.set("Cache-Control", "public, max-age=3600, s-maxage=86400");
+      res.set("X-Cache", "MISS");
       res.removeHeader("link");
+
+      // Cache HTML response
+      if (req.method === "GET" && response.status === 200) {
+        setCache(cacheKey, {
+          status: response.status,
+          body: html,
+          headers: { "Content-Type": "text/html; charset=utf-8", "X-Robots-Tag": "index, follow", "Cache-Control": "public, max-age=3600, s-maxage=86400" },
+          ttl: CACHE_TTL_HTML,
+        });
+      }
+
       return res.status(response.status).send(html);
     }
 
@@ -1536,6 +1655,17 @@ app.all("*", async (req, res) => {
       css = css.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", "text/css; charset=utf-8");
       res.set("Cache-Control", "public, max-age=604800, s-maxage=2592000");
+      res.set("X-Cache", "MISS");
+
+      if (req.method === "GET" && response.status === 200) {
+        setCache(cacheKey, {
+          status: response.status,
+          body: css,
+          headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=604800, s-maxage=2592000" },
+          ttl: CACHE_TTL_ASSET,
+        });
+      }
+
       return res.status(response.status).send(css);
     }
 
@@ -1554,6 +1684,17 @@ app.all("*", async (req, res) => {
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", contentType);
       res.set("Cache-Control", "public, max-age=604800");
+      res.set("X-Cache", "MISS");
+
+      if (req.method === "GET" && response.status === 200) {
+        setCache(cacheKey, {
+          status: response.status,
+          body: body,
+          headers: { "Content-Type": contentType, "Cache-Control": "public, max-age=604800" },
+          ttl: CACHE_TTL_ASSET,
+        });
+      }
+
       return res.status(response.status).send(body);
     }
 
@@ -1593,5 +1734,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`   Origin: ${ORIGIN_HOST}`);
   console.log(`   Mirror: ${MIRROR_HOST || "(auto-detect from Host header)"}`);
   console.log(`   Env: ${process.env.NODE_ENV || "development"}`);
+  console.log(`   Cache: max ${CACHE_MAX_ENTRIES} entries, HTML ${CACHE_TTL_HTML / 1000}s / Asset ${CACHE_TTL_ASSET / 1000}s / Image ${CACHE_TTL_IMAGE / 1000}s`);
+  console.log(`   Strategy: direct-first → last-working-proxy → rotate`);
   console.log(`   Health: http://0.0.0.0:${PORT}/healthz`);
 });
