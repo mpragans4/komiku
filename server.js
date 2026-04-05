@@ -8,6 +8,9 @@ const express = require("express");
 const compression = require("compression");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 const app = express();
 app.use(compression());
@@ -22,6 +25,117 @@ const SITE_NAME = process.env.SITE_NAME || "Komiku";
 const SITE_TAGLINE = process.env.SITE_TAGLINE || "Baca Komik Manga Manhwa Manhua Bahasa Indonesia";
 const SITE_DESCRIPTION = process.env.SITE_DESCRIPTION || "Komiku.io — Situs baca komik manga, manhwa, dan manhua sub Indonesia terlengkap dan terupdate. Gratis tanpa iklan.";
 const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+// ============================================================
+// PROXY ROTATION — Load proxies dari proxy.txt
+// ============================================================
+const PROXY_FILE = path.join(__dirname, "proxy.txt");
+let proxyList = [];
+let proxyIndex = 0;
+
+function loadProxies() {
+  try {
+    const raw = fs.readFileSync(PROXY_FILE, "utf-8");
+    proxyList = raw
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"))
+      .map((line) => {
+        const parts = line.split(":");
+        if (parts.length === 4) {
+          // ip:port:user:pass
+          const [host, port, user, pass] = parts;
+          return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+        } else if (parts.length === 2) {
+          // ip:port (no auth)
+          return `http://${parts[0]}:${parts[1]}`;
+        }
+        return null;
+      })
+      .filter(Boolean);
+    console.log(`📡 Loaded ${proxyList.length} proxies from proxy.txt`);
+  } catch (err) {
+    console.warn("⚠️ proxy.txt not found or unreadable, running without proxies");
+    proxyList = [];
+  }
+}
+loadProxies();
+
+function getNextProxy() {
+  if (proxyList.length === 0) return null;
+  const proxy = proxyList[proxyIndex % proxyList.length];
+  proxyIndex++;
+  return proxy;
+}
+
+function createProxyAgent(proxyUrl) {
+  if (!proxyUrl) return undefined;
+  return new HttpsProxyAgent(proxyUrl);
+}
+
+// DDoS-Guard detection
+function isDdosGuardBlock(body) {
+  if (!body || typeof body !== "string") return false;
+  return (
+    body.includes("ddos-guard") ||
+    body.includes("DDoS-Guard") ||
+    body.includes("is not available") ||
+    body.includes("restricted access from your current IP")
+  );
+}
+
+// Fetch with proxy rotation and retry on DDoS-Guard block
+const MAX_RETRIES = parseInt(process.env.PROXY_MAX_RETRIES, 10) || 5;
+
+async function fetchWithProxy(url, options = {}) {
+  let lastError;
+  const triedProxies = new Set();
+
+  for (let attempt = 0; attempt < Math.min(MAX_RETRIES, proxyList.length || 1); attempt++) {
+    const proxyUrl = getNextProxy();
+    if (proxyUrl && triedProxies.has(proxyUrl)) continue;
+    if (proxyUrl) triedProxies.add(proxyUrl);
+
+    const agent = createProxyAgent(proxyUrl);
+    const fetchOpts = { ...options };
+    if (agent) fetchOpts.agent = agent;
+
+    try {
+      const response = await fetch(url, fetchOpts);
+
+      // For HTML responses, check if DDoS-Guard blocked us
+      const ct = response.headers.get("content-type") || "";
+      if (ct.includes("text/html") && response.status === 403) {
+        const cloned = response.clone();
+        const text = await cloned.text();
+        if (isDdosGuardBlock(text)) {
+          const proxyLabel = proxyUrl ? proxyUrl.replace(/:[^:@]*@/, ":***@") : "direct";
+          console.warn(`⛔ DDoS-Guard block detected (attempt ${attempt + 1}, proxy: ${proxyLabel}), retrying...`);
+          lastError = new Error("DDoS-Guard block");
+          continue;
+        }
+      }
+
+      return response;
+    } catch (err) {
+      const proxyLabel = proxyUrl ? proxyUrl.replace(/:[^:@]*@/, ":***@") : "direct";
+      console.warn(`❌ Fetch failed (attempt ${attempt + 1}, proxy: ${proxyLabel}): ${err.message}`);
+      lastError = err;
+    }
+  }
+
+  // All retries exhausted — try once without proxy as last resort if proxies were used
+  if (proxyList.length > 0) {
+    try {
+      console.warn("🔄 All proxies failed, trying direct connection...");
+      return await fetch(url, options);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("All proxy attempts failed");
+}
 
 // ============================================================
 // HELPER
@@ -129,7 +243,7 @@ async function fetchSitemapXml(urlStr, maxRedirects = 5) {
   let currentUrl = urlStr;
   for (let i = 0; i < maxRedirects; i++) {
     const parsedUrl = new URL(currentUrl);
-    const resp = await fetch(currentUrl, {
+    const resp = await fetchWithProxy(currentUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -215,7 +329,7 @@ app.get("/img-proxy/*", async (req, res) => {
   const imgUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
 
   try {
-    const response = await fetch(imgUrl, {
+    const response = await fetchWithProxy(imgUrl, {
       headers: {
         Host: `img.${ORIGIN_HOST}`,
         "User-Agent": req.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -260,7 +374,7 @@ app.get("/thumb-proxy/*", async (req, res) => {
   const imgUrl = `https://thumbnail.${ORIGIN_HOST}${imgPath}`;
 
   try {
-    const response = await fetch(imgUrl, {
+    const response = await fetchWithProxy(imgUrl, {
       headers: {
         Host: `thumbnail.${ORIGIN_HOST}`,
         "User-Agent": req.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -338,7 +452,7 @@ app.all("/analytics-proxy/*", async (req, res) => {
       if (chunks.length > 0) fetchOptions.body = Buffer.concat(chunks);
     }
 
-    const response = await fetch(apiUrl, fetchOptions);
+    const response = await fetchWithProxy(apiUrl, fetchOptions);
     const contentType = response.headers.get("content-type") || "";
 
     for (const h of ["content-type", "last-modified", "etag"]) {
@@ -400,7 +514,7 @@ app.all("/api-proxy/*", async (req, res) => {
       if (chunks.length > 0) fetchOptions.body = Buffer.concat(chunks);
     }
 
-    const response = await fetch(apiUrl, fetchOptions);
+    const response = await fetchWithProxy(apiUrl, fetchOptions);
 
     // Handle redirects
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -496,7 +610,7 @@ app.all("*", async (req, res) => {
       }
     }
 
-    const response = await fetch(originUrl, fetchOptions);
+    const response = await fetchWithProxy(originUrl, fetchOptions);
 
     // ============================
     // 2. HANDLE REDIRECT (3xx)

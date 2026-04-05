@@ -11,8 +11,9 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.21.0",
     "compression": "^1.7.4",
+    "express": "^4.21.0",
+    "https-proxy-agent": "^5.0.1",
     "node-fetch": "^2.7.0"
   }
 }
