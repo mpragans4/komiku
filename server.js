@@ -22,7 +22,9 @@ app.set("trust proxy", true);
 const ORIGIN_HOST = process.env.ORIGIN_HOST || "komiku.org";
 const MIRROR_HOST = process.env.MIRROR_HOST || "komiku.io";
 // Fallback origins when primary is blocked by DDoS-Guard
-const FALLBACK_ORIGINS = (process.env.FALLBACK_ORIGINS || "secure.komikid.org").split(",").map(s => s.trim()).filter(Boolean);
+const FALLBACK_ORIGINS = (process.env.FALLBACK_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+// User-Agent to use for origin requests — Googlebot UA bypasses DDoS-Guard
+const ORIGIN_UA = process.env.ORIGIN_UA || "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
 const SITE_NAME = process.env.SITE_NAME || "Komiku";
 const SITE_TAGLINE = process.env.SITE_TAGLINE || "Baca Komik Manga Manhwa Manhua Bahasa Indonesia";
 const SITE_DESCRIPTION = process.env.SITE_DESCRIPTION || "Komiku.io — Situs baca komik manga, manhwa, dan manhua sub Indonesia terlengkap dan terupdate. Gratis tanpa iklan.";
@@ -241,6 +243,20 @@ async function fetchSingleAttempt(url, options, agent) {
     if (check.blocked) {
       return { success: false, blocked: true };
     }
+
+    // Validate: reject empty HTML body responses (broken origin/CDN)
+    const ct = response.headers.get("content-type") || "";
+    if (ct.includes("text/html") && response.status === 200) {
+      // If body was pre-read, check it; otherwise read and check
+      const body = check.body !== null ? check.body : await response.text();
+      if (!body || body.length < 100) {
+        console.warn(`⚠️ Empty/tiny HTML response (${body ? body.length : 0} bytes) from ${url}, rejecting...`);
+        return { success: false, blocked: false, error: new Error('Empty HTML response') };
+      }
+      // Body was consumed, attach it for reuse
+      return { success: true, response, preReadBody: body };
+    }
+
     // Return pre-read body if available (for HTML), avoids double-read issues
     return { success: true, response, preReadBody: check.body };
   } catch (err) {
@@ -570,7 +586,7 @@ app.get("/img-proxy/*", async (req, res) => {
     const response = await fetchWithProxy(imgUrl, {
       headers: {
         Host: `img.${ORIGIN_HOST}`,
-        "User-Agent": req.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": ORIGIN_UA,
         Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         Referer: `https://${ORIGIN_HOST}/`,
@@ -615,7 +631,7 @@ app.get("/thumb-proxy/*", async (req, res) => {
     const response = await fetchWithProxy(imgUrl, {
       headers: {
         Host: `thumbnail.${ORIGIN_HOST}`,
-        "User-Agent": req.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": ORIGIN_UA,
         Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         Referer: `https://${ORIGIN_HOST}/`,
@@ -685,7 +701,7 @@ app.all("/analytics-proxy/*", async (req, res) => {
   try {
     const proxyHeaders = {
       Host: `analytics.${ORIGIN_HOST}`,
-      "User-Agent": req.get("user-agent") || "Mozilla/5.0",
+      "User-Agent": ORIGIN_UA,
       Accept: req.get("accept") || "*/*",
       "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9",
       "Accept-Encoding": "gzip, deflate",
@@ -746,7 +762,7 @@ app.all("/api-proxy/*", async (req, res) => {
   try {
     const proxyHeaders = {
       Host: `api.${ORIGIN_HOST}`,
-      "User-Agent": req.get("user-agent") || "Mozilla/5.0",
+      "User-Agent": ORIGIN_UA,
       Accept: req.get("accept") || "*/*",
       "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9",
       "Accept-Encoding": "gzip, deflate",
@@ -849,9 +865,8 @@ app.all("*", async (req, res) => {
   const proxyHeaders = {
     Host: useOrigin,
     "X-Forwarded-Host": mirrorHost,
-    "User-Agent":
-      req.get("user-agent") ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    // Use Googlebot UA for origin requests to bypass DDoS-Guard IP blocking
+    "User-Agent": ORIGIN_UA,
     Accept: req.get("accept") || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate",
