@@ -578,26 +578,68 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xm
 // ============================================================
 // IMAGE PROXY — Proxy img.komiku.org to bypass Cloudflare 403
 // ============================================================
+// Realistic browser UA for image requests (Googlebot UA may be blocked on CDN)
+const IMAGE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Helper: try fetching image with multiple header strategies
+async function fetchImageWithRetry(imgUrl, hostHeader) {
+  const strategies = [
+    // Strategy 1: Chrome browser UA, Referer from origin
+    {
+      Host: hostHeader,
+      "User-Agent": IMAGE_UA,
+      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+      Referer: `https://${ORIGIN_HOST}/`,
+      "Sec-Fetch-Dest": "image",
+      "Sec-Fetch-Mode": "no-cors",
+      "Sec-Fetch-Site": "cross-site",
+    },
+    // Strategy 2: Googlebot UA (some CDNs whitelist it)
+    {
+      Host: hostHeader,
+      "User-Agent": ORIGIN_UA,
+      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      "Accept-Encoding": "gzip, deflate",
+      Referer: `https://${ORIGIN_HOST}/`,
+    },
+    // Strategy 3: Minimal headers, no Referer/Origin
+    {
+      Host: hostHeader,
+      "User-Agent": IMAGE_UA,
+      Accept: "image/*,*/*;q=0.8",
+    },
+  ];
+
+  for (let i = 0; i < strategies.length; i++) {
+    try {
+      const response = await fetchWithProxy(imgUrl, {
+        headers: strategies[i],
+        redirect: "follow",
+        timeout: 30000,
+      });
+      if (response.ok) return response;
+      // If 403/blocked, try next strategy
+      console.warn(`⚠️ Image fetch strategy ${i + 1} got ${response.status} for ${imgUrl}`);
+      // Consume body to prevent memory leak
+      try { await response.text(); } catch (_) {}
+    } catch (err) {
+      console.warn(`⚠️ Image fetch strategy ${i + 1} failed for ${imgUrl}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
 app.get("/img-proxy/*", async (req, res) => {
   const imgPath = req.originalUrl.replace(/^\/img-proxy/, "");
   const imgUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
 
   try {
-    const response = await fetchWithProxy(imgUrl, {
-      headers: {
-        Host: `img.${ORIGIN_HOST}`,
-        "User-Agent": ORIGIN_UA,
-        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        Referer: `https://${ORIGIN_HOST}/`,
-        Origin: `https://${ORIGIN_HOST}`,
-      },
-      redirect: "follow",
-      timeout: 30000,
-    });
+    const response = await fetchImageWithRetry(imgUrl, `img.${ORIGIN_HOST}`);
 
-    if (!response.ok) {
-      return res.status(response.status).end();
+    if (!response) {
+      return res.status(502).end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -625,24 +667,24 @@ app.get("/img-proxy/*", async (req, res) => {
 // ============================================================
 app.get("/thumb-proxy/*", async (req, res) => {
   const imgPath = req.originalUrl.replace(/^\/thumb-proxy/, "");
-  const imgUrl = `https://thumbnail.${ORIGIN_HOST}${imgPath}`;
+
+  // Try multiple thumbnail hosts in case primary is blocked
+  const thumbHosts = [
+    `thumbnail.${ORIGIN_HOST}`,
+    `cdn.${ORIGIN_HOST}`,
+    `img.${ORIGIN_HOST}`,
+  ];
 
   try {
-    const response = await fetchWithProxy(imgUrl, {
-      headers: {
-        Host: `thumbnail.${ORIGIN_HOST}`,
-        "User-Agent": ORIGIN_UA,
-        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        Referer: `https://${ORIGIN_HOST}/`,
-        Origin: `https://${ORIGIN_HOST}`,
-      },
-      redirect: "follow",
-      timeout: 30000,
-    });
+    let response = null;
+    for (const thumbHost of thumbHosts) {
+      const imgUrl = `https://${thumbHost}${imgPath}`;
+      response = await fetchImageWithRetry(imgUrl, thumbHost);
+      if (response) break;
+    }
 
-    if (!response.ok) {
-      return res.status(response.status).end();
+    if (!response) {
+      return res.status(502).end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -660,8 +702,78 @@ app.get("/thumb-proxy/*", async (req, res) => {
     res.status(200);
     response.body.pipe(res);
   } catch (err) {
-    console.error("Thumbnail proxy error:", err.message, "URL:", imgUrl);
+    console.error("Thumbnail proxy error:", err.message, "URL:", imgPath);
     res.status(502).end();
+  }
+});
+
+// ============================================================
+// PLUS PROXY — Proxy requests to plus.komiku.org to avoid CORS
+// ============================================================
+app.all("/plus-proxy/*", async (req, res) => {
+  const mirrorHost = getMirrorHost(req);
+  const apiPath = req.originalUrl.replace(/^\/plus-proxy/, "");
+  const apiUrl = `https://plus.${ORIGIN_HOST}${apiPath}`;
+
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    res.set("Access-Control-Allow-Origin", `https://${mirrorHost}`);
+    res.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Requested-With");
+    res.set("Access-Control-Max-Age", "86400");
+    return res.status(204).end();
+  }
+
+  try {
+    const proxyHeaders = {
+      Host: `plus.${ORIGIN_HOST}`,
+      "User-Agent": ORIGIN_UA,
+      Accept: req.get("accept") || "*/*",
+      "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9",
+      "Accept-Encoding": "gzip, deflate",
+      Referer: `https://${ORIGIN_HOST}/`,
+      Origin: `https://${ORIGIN_HOST}`,
+    };
+
+    const fetchOptions = {
+      method: req.method,
+      headers: proxyHeaders,
+      redirect: "follow",
+      timeout: 30000,
+    };
+
+    if (["POST", "PUT", "PATCH"].includes(req.method)) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      if (chunks.length > 0) fetchOptions.body = Buffer.concat(chunks);
+    }
+
+    const response = await fetchWithProxy(apiUrl, fetchOptions);
+    const contentType = response.headers.get("content-type") || "";
+
+    for (const h of ["content-type", "last-modified", "etag"]) {
+      const val = response.headers.get(h);
+      if (val) res.set(h, val);
+    }
+    res.set("Cache-Control", "public, max-age=300, s-maxage=600");
+    res.set("Access-Control-Allow-Origin", `https://${mirrorHost}`);
+    res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+
+    if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
+      let body = await response.text();
+      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
+      body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
+      return res.status(response.status).send(body);
+    }
+
+    res.status(response.status);
+    response.body.pipe(res);
+  } catch (err) {
+    console.error("Plus proxy error:", err.message, "URL:", apiUrl);
+    res.status(502).json({ error: "Plus proxy failed" });
   }
 });
 
@@ -819,6 +931,7 @@ app.all("/api-proxy/*", async (req, res) => {
       let body = await response.text();
       body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       return res.status(response.status).send(body);
@@ -950,6 +1063,8 @@ app.all("*", async (req, res) => {
       html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       // A0. Rewrite analytics.komiku.org → mirror/analytics-proxy
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
+      // A0b. Rewrite plus.komiku.org → mirror/plus-proxy
+      html = html.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       // A1. Rewrite api.komiku.org → mirror/api-proxy (HARUS SEBELUM rewrite domain utama)
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       // A2. Rewrite domain utama
@@ -1788,6 +1903,7 @@ app.all("*", async (req, res) => {
       html = html.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
+      html = html.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
       // Protocol-relative URLs
@@ -1854,6 +1970,7 @@ app.all("*", async (req, res) => {
       body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", contentType);
