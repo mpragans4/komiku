@@ -438,7 +438,7 @@ app.get("/healthz", (req, res) => {
   res.status(200).json({
     status: "ok",
     timestamp: Date.now(),
-    cache: { entries: responseCache.size, maxEntries: CACHE_MAX_ENTRIES },
+    cache: { entries: responseCache.size, maxEntries: CACHE_MAX_ENTRIES, imageEntries: imageCache.size, imageMax: IMAGE_CACHE_MAX },
     proxy: { total: proxyList.length, directBlocked, lastWorkingProxy: !!lastWorkingProxy },
     origin: { primary: ORIGIN_HOST, current: currentWorkingOrigin, fallbacks: FALLBACK_ORIGINS },
     ddosGuardCookies: Object.keys(ddosGuardCookies).length,
@@ -581,10 +581,63 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xm
 // Realistic browser UA for image requests (Googlebot UA may be blocked on CDN)
 const IMAGE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// Helper: try fetching image with multiple header strategies
+// --- In-memory image cache (small, for frequently accessed thumbnails) ---
+const IMAGE_CACHE_MAX = parseInt(process.env.IMAGE_CACHE_MAX, 10) || 200;
+const IMAGE_CACHE_TTL = parseInt(process.env.IMAGE_CACHE_TTL, 10) || 600 * 1000; // 10 min
+const imageCache = new Map();
+
+function getCachedImage(key) {
+  const entry = imageCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > IMAGE_CACHE_TTL) {
+    imageCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function setCachedImage(key, buffer, contentType) {
+  if (imageCache.size >= IMAGE_CACHE_MAX) {
+    const firstKey = imageCache.keys().next().value;
+    imageCache.delete(firstKey);
+  }
+  imageCache.set(key, { buffer, contentType, ts: Date.now() });
+}
+
+// Helper: fast direct image fetch with content-type validation (no DDoS-Guard logic)
+async function fetchImageDirect(url, headers, agent, timeout = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const opts = { headers, redirect: "follow", signal: controller.signal };
+    if (agent) opts.agent = agent;
+    const response = await fetch(url, opts);
+    clearTimeout(timer);
+    if (!response.ok) {
+      try { await response.text(); } catch (_) {}
+      return null;
+    }
+    // CRITICAL: Validate response is actually an image, not an HTML challenge page
+    const ct = response.headers.get("content-type") || "";
+    if (ct.includes("text/html") || ct.includes("text/plain") || ct.includes("text/xml")) {
+      console.warn(`⚠️ Image URL returned ${ct} instead of image: ${url}`);
+      try { await response.text(); } catch (_) {}
+      return null;
+    }
+    return response;
+  } catch (err) {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
+// Helper: try fetching image from multiple hosts with fast direct fetch + proxy + wsrv.nl fallback
 async function fetchImageWithRetry(imgUrl, hostHeader) {
-  const strategies = [
-    // Strategy 1: Chrome browser UA, Referer from origin
+  const parsedUrl = new URL(imgUrl);
+  const imgPath = parsedUrl.pathname + parsedUrl.search;
+
+  // Header sets to try (from most to least specific)
+  const headerSets = [
     {
       Host: hostHeader,
       "User-Agent": IMAGE_UA,
@@ -596,38 +649,46 @@ async function fetchImageWithRetry(imgUrl, hostHeader) {
       "Sec-Fetch-Mode": "no-cors",
       "Sec-Fetch-Site": "cross-site",
     },
-    // Strategy 2: Googlebot UA (some CDNs whitelist it)
     {
       Host: hostHeader,
       "User-Agent": ORIGIN_UA,
-      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-      "Accept-Encoding": "gzip, deflate",
-      Referer: `https://${ORIGIN_HOST}/`,
-    },
-    // Strategy 3: Minimal headers, no Referer/Origin
-    {
-      Host: hostHeader,
-      "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
+      Referer: `https://${ORIGIN_HOST}/`,
     },
   ];
 
-  for (let i = 0; i < strategies.length; i++) {
-    try {
-      const response = await fetchWithProxy(imgUrl, {
-        headers: strategies[i],
-        redirect: "follow",
-        timeout: 30000,
-      });
-      if (response.ok) return response;
-      // If 403/blocked, try next strategy
-      console.warn(`⚠️ Image fetch strategy ${i + 1} got ${response.status} for ${imgUrl}`);
-      // Consume body to prevent memory leak
-      try { await response.text(); } catch (_) {}
-    } catch (err) {
-      console.warn(`⚠️ Image fetch strategy ${i + 1} failed for ${imgUrl}: ${err.message}`);
+  // === ATTEMPT 1: Direct fetch (fastest) ===
+  for (const headers of headerSets) {
+    const response = await fetchImageDirect(imgUrl, headers, undefined, 8000);
+    if (response) return response;
+  }
+
+  // === ATTEMPT 2: Through proxy (if available) ===
+  if (proxyList.length > 0) {
+    const proxyUrl = lastWorkingProxy || getNextProxy();
+    if (proxyUrl) {
+      const agent = getProxyAgent(proxyUrl);
+      const response = await fetchImageDirect(imgUrl, headerSets[0], agent, 10000);
+      if (response) {
+        lastWorkingProxy = proxyUrl;
+        return response;
+      }
     }
   }
+
+  // === ATTEMPT 3: Try via wsrv.nl external image CDN (bypasses Cloudflare/DDoS-Guard) ===
+  try {
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&default=placeholder`;
+    const response = await fetchImageDirect(wsrvUrl, {
+      "User-Agent": IMAGE_UA,
+      Accept: "image/*,*/*;q=0.8",
+    }, undefined, 10000);
+    if (response) {
+      console.log(`✅ wsrv.nl fallback worked for: ${imgUrl}`);
+      return response;
+    }
+  } catch (_) {}
+
   return null;
 }
 
@@ -635,11 +696,47 @@ app.get("/img-proxy/*", async (req, res) => {
   const imgPath = req.originalUrl.replace(/^\/img-proxy/, "");
   const imgUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
 
+  // Check in-memory image cache first
+  const cacheKey = `img:${imgPath}`;
+  const cached = getCachedImage(cacheKey);
+  if (cached) {
+    res.set("Content-Type", cached.contentType);
+    res.set("Content-Length", String(cached.buffer.length));
+    res.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("X-Cache", "HIT");
+    return res.status(200).send(cached.buffer);
+  }
+
   try {
-    const response = await fetchImageWithRetry(imgUrl, `img.${ORIGIN_HOST}`);
+    // Try primary host first, then fallbacks
+    const imgHosts = [
+      `img.${ORIGIN_HOST}`,
+      `cdn.${ORIGIN_HOST}`,
+      `thumbnail.${ORIGIN_HOST}`,
+      ORIGIN_HOST,
+    ];
+
+    let response = null;
+    for (const imgHost of imgHosts) {
+      const url = `https://${imgHost}${imgPath}`;
+      response = await fetchImageWithRetry(url, imgHost);
+      if (response) break;
+    }
 
     if (!response) {
-      return res.status(502).end();
+      // Last resort: wsrv.nl with primary URL
+      try {
+        const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&default=placeholder`;
+        response = await fetchImageDirect(wsrvUrl, {
+          "User-Agent": IMAGE_UA,
+          Accept: "image/*,*/*;q=0.8",
+        }, undefined, 12000);
+      } catch (_) {}
+    }
+
+    if (!response) {
+      return res.status(502).set("Cache-Control", "no-cache").end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -653,12 +750,25 @@ app.get("/img-proxy/*", async (req, res) => {
     if (etag) res.set("ETag", etag);
     res.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
     res.set("Access-Control-Allow-Origin", "*");
+    res.set("X-Cache", "MISS");
+
+    // Buffer small images into memory cache
+    const sizeHint = parseInt(contentLength, 10) || 0;
+    if (sizeHint > 0 && sizeHint < 500000) {
+      const chunks = [];
+      response.body.on("data", (chunk) => chunks.push(chunk));
+      response.body.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        setCachedImage(cacheKey, buffer, contentType);
+      });
+      response.body.on("error", () => {});
+    }
 
     res.status(200);
     response.body.pipe(res);
   } catch (err) {
     console.error("Image proxy error:", err.message, "URL:", imgUrl);
-    res.status(502).end();
+    res.status(502).set("Cache-Control", "no-cache").end();
   }
 });
 
@@ -668,11 +778,24 @@ app.get("/img-proxy/*", async (req, res) => {
 app.get("/thumb-proxy/*", async (req, res) => {
   const imgPath = req.originalUrl.replace(/^\/thumb-proxy/, "");
 
+  // Check in-memory image cache first
+  const cacheKey = `thumb:${imgPath}`;
+  const cached = getCachedImage(cacheKey);
+  if (cached) {
+    res.set("Content-Type", cached.contentType);
+    res.set("Content-Length", String(cached.buffer.length));
+    res.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("X-Cache", "HIT");
+    return res.status(200).send(cached.buffer);
+  }
+
   // Try multiple thumbnail hosts in case primary is blocked
   const thumbHosts = [
     `thumbnail.${ORIGIN_HOST}`,
     `cdn.${ORIGIN_HOST}`,
     `img.${ORIGIN_HOST}`,
+    ORIGIN_HOST,
   ];
 
   try {
@@ -684,7 +807,19 @@ app.get("/thumb-proxy/*", async (req, res) => {
     }
 
     if (!response) {
-      return res.status(502).end();
+      // Last resort: try wsrv.nl with the primary thumbnail URL
+      const primaryUrl = `https://thumbnail.${ORIGIN_HOST}${imgPath}`;
+      try {
+        const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(primaryUrl)}&default=placeholder`;
+        response = await fetchImageDirect(wsrvUrl, {
+          "User-Agent": IMAGE_UA,
+          Accept: "image/*,*/*;q=0.8",
+        }, undefined, 12000);
+      } catch (_) {}
+    }
+
+    if (!response) {
+      return res.status(502).set("Cache-Control", "no-cache").end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -698,12 +833,26 @@ app.get("/thumb-proxy/*", async (req, res) => {
     if (etag) res.set("ETag", etag);
     res.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
     res.set("Access-Control-Allow-Origin", "*");
+    res.set("X-Cache", "MISS");
+
+    // Buffer small images into memory cache for faster subsequent requests
+    const sizeHint = parseInt(contentLength, 10) || 0;
+    if (sizeHint > 0 && sizeHint < 500000) {
+      // Small enough to cache in memory
+      const chunks = [];
+      response.body.on("data", (chunk) => chunks.push(chunk));
+      response.body.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        setCachedImage(cacheKey, buffer, contentType);
+      });
+      response.body.on("error", () => {}); // ignore stream errors during caching
+    }
 
     res.status(200);
     response.body.pipe(res);
   } catch (err) {
     console.error("Thumbnail proxy error:", err.message, "URL:", imgPath);
-    res.status(502).end();
+    res.status(502).set("Cache-Control", "no-cache").end();
   }
 });
 
