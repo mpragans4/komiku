@@ -656,7 +656,7 @@ async function solveCfForImages() {
 }
 
 // --- Simple image fetch (fast, validate content-type) ---
-async function fetchImageSimple(url, headers, agent, timeout = 5000) {
+async function fetchImageSimple(url, headers, agent, timeout = 6000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
@@ -681,70 +681,55 @@ async function fetchImageSimple(url, headers, agent, timeout = 5000) {
   }
 }
 
-// Helper: fetch image via proxy — try lastWorking first, then 1 rotated proxy
-async function fetchImageViaProxy(url, hostHeader) {
-  if (proxyList.length === 0) return null;
-
-  const headers = {
-    Host: hostHeader,
-    "User-Agent": IMAGE_UA,
-    Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-    Referer: `https://${ORIGIN_HOST}/`,
-    "Sec-Fetch-Dest": "image",
-    "Sec-Fetch-Mode": "no-cors",
-    "Sec-Fetch-Site": "same-origin",
-  };
-
-  // Try last working proxy first (fastest path)
-  if (lastWorkingProxy) {
-    const agent = getProxyAgent(lastWorkingProxy);
-    const response = await fetchImageSimple(url, headers, agent, 5000);
-    if (response) return response;
-  }
-
-  // Try 2 rotated proxies
-  for (let i = 0; i < 2; i++) {
-    const proxyUrl = getNextProxy();
-    if (!proxyUrl || proxyUrl === lastWorkingProxy) continue;
-    const agent = getProxyAgent(proxyUrl);
-    const response = await fetchImageSimple(url, headers, agent, 5000);
-    if (response) {
-      lastWorkingProxy = proxyUrl;
-      return response;
-    }
-  }
-
-  lastWorkingProxy = null;
-  return null;
-}
-
-// Main image fetch: FAST — max ~15s total per image
+// Main image fetch: DIRECT from server (confirmed working from Railway)
 // @param {string} imgPath - path like /uploads/manga/...
 // @param {string} preferredHost - e.g. 'img.komiku.org' or 'thumbnail.komiku.org'
 async function fetchImageWithRetry(imgPath, preferredHost) {
-  const preferredUrl = `https://${preferredHost}${imgPath}`;
+  const headers = {
+    "User-Agent": IMAGE_UA,
+    Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    Referer: `https://${ORIGIN_HOST}/`,
+  };
 
-  // === ATTEMPT 1: Preferred host via proxy (fastest — uses lastWorkingProxy) ===
+  // === ATTEMPT 1: Direct fetch from preferred host (fastest) ===
   {
-    const response = await fetchImageViaProxy(preferredUrl, preferredHost);
+    const url = `https://${preferredHost}${imgPath}`;
+    const response = await fetchImageSimple(url, headers, undefined, 8000);
     if (response) return response;
   }
 
-  // === ATTEMPT 2: Try img.komiku.org if preferred was thumbnail (or vice versa) ===
+  // === ATTEMPT 2: Try alternative host (img ↔ thumbnail) ===
   {
     const altHost = preferredHost.startsWith("thumbnail.")
       ? `img.${ORIGIN_HOST}`
       : `thumbnail.${ORIGIN_HOST}`;
-    const altUrl = `https://${altHost}${imgPath}`;
-    const response = await fetchImageViaProxy(altUrl, altHost);
+    const url = `https://${altHost}${imgPath}`;
+    const response = await fetchImageSimple(url, headers, undefined, 8000);
     if (response) return response;
   }
 
-  // === ATTEMPT 3: wsrv.nl (bypasses CF) ===
+  // === ATTEMPT 3: Try via proxy.txt (in case direct gets blocked later) ===
+  if (proxyList.length > 0) {
+    const proxyUrl = lastWorkingProxy || getNextProxy();
+    if (proxyUrl) {
+      const agent = getProxyAgent(proxyUrl);
+      const url = `https://${preferredHost}${imgPath}`;
+      const response = await fetchImageSimple(url, {
+        ...headers,
+        Host: preferredHost,
+      }, agent, 6000);
+      if (response) {
+        lastWorkingProxy = proxyUrl;
+        return response;
+      }
+    }
+  }
+
+  // === ATTEMPT 4: wsrv.nl external CDN ===
   try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(preferredUrl)}&n=-1`;
+    const url = `https://${preferredHost}${imgPath}`;
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(url)}&n=-1`;
     const response = await fetchImageSimple(wsrvUrl, {
       "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
