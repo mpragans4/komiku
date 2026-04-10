@@ -599,7 +599,7 @@ const IMAGE_CACHE_TTL = parseInt(process.env.IMAGE_CACHE_TTL, 10) || 600 * 1000;
 const imageCache = new Map();
 
 // --- Concurrent image fetch limiter (prevent resource exhaustion) ---
-const MAX_CONCURRENT_IMAGE_FETCHES = parseInt(process.env.MAX_CONCURRENT_IMAGE_FETCHES, 10) || 10;
+const MAX_CONCURRENT_IMAGE_FETCHES = parseInt(process.env.MAX_CONCURRENT_IMAGE_FETCHES, 10) || 20;
 let activeImageFetches = 0;
 const imageQueue = [];
 
@@ -655,8 +655,8 @@ async function solveCfForImages() {
   return null;
 }
 
-// --- Simple image fetch (no CF detection overhead, just fetch and validate content-type) ---
-async function fetchImageSimple(url, headers, agent, timeout = 10000) {
+// --- Simple image fetch (fast, validate content-type) ---
+async function fetchImageSimple(url, headers, agent, timeout = 5000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
@@ -681,8 +681,8 @@ async function fetchImageSimple(url, headers, agent, timeout = 10000) {
   }
 }
 
-// Helper: fetch image via proxy rotation from proxy.txt
-async function fetchImageViaProxy(url, hostHeader, maxAttempts = 3) {
+// Helper: fetch image via proxy — try lastWorking first, then 1 rotated proxy
+async function fetchImageViaProxy(url, hostHeader) {
   if (proxyList.length === 0) return null;
 
   const headers = {
@@ -697,75 +697,60 @@ async function fetchImageViaProxy(url, hostHeader, maxAttempts = 3) {
     "Sec-Fetch-Site": "same-origin",
   };
 
-  // Try last working proxy first
+  // Try last working proxy first (fastest path)
   if (lastWorkingProxy) {
     const agent = getProxyAgent(lastWorkingProxy);
-    const response = await fetchImageSimple(url, headers, agent, 10000);
+    const response = await fetchImageSimple(url, headers, agent, 5000);
     if (response) return response;
-    lastWorkingProxy = null; // mark as no longer working
   }
 
-  // Rotate through proxies
-  for (let i = 0; i < Math.min(maxAttempts, proxyList.length); i++) {
+  // Try 2 rotated proxies
+  for (let i = 0; i < 2; i++) {
     const proxyUrl = getNextProxy();
-    if (!proxyUrl) continue;
+    if (!proxyUrl || proxyUrl === lastWorkingProxy) continue;
     const agent = getProxyAgent(proxyUrl);
-    const response = await fetchImageSimple(url, headers, agent, 10000);
+    const response = await fetchImageSimple(url, headers, agent, 5000);
     if (response) {
       lastWorkingProxy = proxyUrl;
       return response;
     }
   }
+
+  lastWorkingProxy = null;
   return null;
 }
 
-// Main image fetch strategy:
-// 1. Proxy to ORIGIN (komiku.org) — main domain serves images too
-// 2. Proxy to img.komiku.org — may work through some proxies
-// 3. Direct to ORIGIN (komiku.org) — no CF on main domain
-// 4. wsrv.nl as last resort
-// Main image fetch: try multiple hosts via proxy rotation
+// Main image fetch: FAST — max ~15s total per image
 // @param {string} imgPath - path like /uploads/manga/...
 // @param {string} preferredHost - e.g. 'img.komiku.org' or 'thumbnail.komiku.org'
 async function fetchImageWithRetry(imgPath, preferredHost) {
-  // Build list of hosts to try (preferred first, then alternatives)
-  const hosts = [preferredHost];
-  if (preferredHost !== `img.${ORIGIN_HOST}`) hosts.push(`img.${ORIGIN_HOST}`);
-  if (preferredHost !== `thumbnail.${ORIGIN_HOST}`) hosts.push(`thumbnail.${ORIGIN_HOST}`);
-  if (preferredHost !== `cdn.${ORIGIN_HOST}`) hosts.push(`cdn.${ORIGIN_HOST}`);
+  const preferredUrl = `https://${preferredHost}${imgPath}`;
 
-  // === ATTEMPT 1: Via proxy rotation (proxy.txt) — try each host ===
-  for (const host of hosts) {
-    const url = `https://${host}${imgPath}`;
-    const response = await fetchImageViaProxy(url, host, 3);
+  // === ATTEMPT 1: Preferred host via proxy (fastest — uses lastWorkingProxy) ===
+  {
+    const response = await fetchImageViaProxy(preferredUrl, preferredHost);
     if (response) return response;
   }
 
-  // === ATTEMPT 2: Direct fetch (without proxy) — may work for some hosts ===
-  for (const host of hosts) {
-    const url = `https://${host}${imgPath}`;
-    const response = await fetchImageSimple(url, {
-      Host: host,
-      "User-Agent": ORIGIN_UA,
+  // === ATTEMPT 2: Try img.komiku.org if preferred was thumbnail (or vice versa) ===
+  {
+    const altHost = preferredHost.startsWith("thumbnail.")
+      ? `img.${ORIGIN_HOST}`
+      : `thumbnail.${ORIGIN_HOST}`;
+    const altUrl = `https://${altHost}${imgPath}`;
+    const response = await fetchImageViaProxy(altUrl, altHost);
+    if (response) return response;
+  }
+
+  // === ATTEMPT 3: wsrv.nl (bypasses CF) ===
+  try {
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(preferredUrl)}&n=-1`;
+    const response = await fetchImageSimple(wsrvUrl, {
+      "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
-      Referer: `https://${ORIGIN_HOST}/`,
-    }, undefined, 10000);
+    }, undefined, 8000);
     if (response) return response;
-  }
-
-  // === ATTEMPT 3: wsrv.nl external CDN ===
-  for (const host of [preferredHost, `img.${ORIGIN_HOST}`]) {
-    try {
-      const url = `https://${host}${imgPath}`;
-      const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(url)}&n=-1`;
-      const response = await fetchImageSimple(wsrvUrl, {
-        "User-Agent": IMAGE_UA,
-        Accept: "image/*,*/*;q=0.8",
-      }, undefined, 12000);
-      if (response) return response;
-    } catch (_) {}
-    if (host === preferredHost && preferredHost === `img.${ORIGIN_HOST}`) break;
-  }
+  } catch (_) {}
 
   return null;
 }
